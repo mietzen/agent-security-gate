@@ -1,0 +1,133 @@
+hard_deny:
+- name: privilege_escalation
+  command: sudo|su|doas
+  reason: Privilege escalation is forbidden.
+- name: disk_destruction
+  command: mkfs(\.\w+)?|dd|fdisk|parted
+  reason: Raw disk modification or filesystem formatting is forbidden.
+- name: diskutil_erasure
+  regex: \bdiskutil\s+erase\w*
+  reason: Disk erasure commands are forbidden.
+- name: remote_pipe_to_shell
+  regex: \|\s*(ba|z|k|t?c)?sh\b
+  reason: Piping remote download directly into shell execution is forbidden.
+  command: curl|wget
+- name: awk_system_escape
+  command: awk
+  regex: system\s*\(
+  reason: Embedded system() execution in awk is forbidden.
+- name: docker_privileged
+  command: docker
+  regex: \brun\b.*--privileged
+  reason: Running Docker with --privileged flag is forbidden.
+- name: docker_root_mount
+  command: docker
+  regex: \brun\b.*-v\s+/(:\S*)?(\s|$)
+  reason: Mounting host root filesystem into container is forbidden.
+- name: python_break_system
+  command: pip|pip3
+  regex: --break-system-packages
+  reason: Modifying system Python with --break-system-packages is forbidden.
+deletion_engine:
+  temp_directories:
+  - /tmp
+  - /private/tmp
+  - /var/folders
+  - $TMPDIR
+  on_temp: allow
+  on_workspace: force_ask
+  on_external: deny
+confirm_required:
+- name: sed_in_place
+  command: sed
+  regex: -i\b|-i\s*''
+  reason: Confirm in-place file modification with sed -i.
+- name: yq_in_place
+  command: yq
+  regex: -i\b
+  reason: Confirm in-place YAML file modification with yq -i.
+- name: git_destructive
+  command: git
+  regex: \b(reset\s+--hard|clean\s+-[a-zA-Z]*f|restore\s+\.|checkout\s+--\s+\.)\b
+  reason: Confirm destructive git operation (discards local changes).
+- name: git_push_commit
+  command: git
+  regex: \b(push|commit)\b
+  reason: Confirm git state modification (commit/push).
+- name: package_management
+  command: pip|pip3|uv|poetry|npm|pnpm|yarn|brew|go
+  regex: \b(install|add|i|mod\s+tidy|get)\b
+  reason: Confirm package/dependency modification.
+- name: docker_lifecycle
+  command: docker
+  regex: \b(run|stop|restart|exec|rm|rmi)\b
+  reason: Confirm Docker container lifecycle / execution operation.
+- name: docker_compose_lifecycle
+  command: docker-compose
+  reason: Confirm Docker Compose lifecycle operation.
+- name: docker_compose_subcommand
+  command: docker
+  regex: \bcompose\s+(up|down|stop|restart|exec|run)\b
+  reason: Confirm Docker Compose lifecycle operation.
+- name: curl_mutating_api
+  command: curl
+  regex: -X\s*(POST|PUT|DELETE|PATCH)|-d\s*@
+  reason: Confirm state-mutating HTTP API request.
+- name: curl_download_to_cwd
+  command: curl
+  regex: -O\b
+  reason: Confirm downloading remote file directly into working directory.
+- name: wget_download_to_cwd
+  command: wget
+  negative_regex: -P\s+(/tmp|/private/tmp|\$TMPDIR)
+  reason: Confirm downloading remote file directly into working directory.
+- name: local_shell_script
+  regex: ^\./|\b(ba|z|k)?sh\s+[^-\s]
+  negative_regex: \b(ba|z)?sh\s+-n\b
+  reason: Confirm execution of local shell script.
+auto_allowed:
+- name: temp_dir_creation
+  command: mktemp
+  reason: Temp directory creation allowed.
+- name: inspection_coreutils
+  command: ls|cat|head|tail|grep|rg|find|stat|file|wc|diff|echo|pwd|which|type|tr|cut|sort|uniq|paste|column|tree
+  reason: Read-only inspection / stream tool allowed.
+- name: data_wrangling_read
+  command: jq|yq
+  negative_regex: -i\b
+  reason: Read-only data filtering (jq/yq) allowed.
+- name: devops_lint_test
+  command: pytest|ruff|mypy|flake8|black|golangci-lint|staticcheck
+  reason: DevOps build / test / lint inspection allowed.
+- name: python_test_venv
+  command: python|python3
+  regex: -m\s+(unittest|pytest|venv)\b
+  reason: Python test/venv command allowed.
+- name: go_test_build
+  command: go
+  regex: \b(test|vet|build|doc|list)\b
+  reason: Go test/build inspection allowed.
+- name: docker_inspection
+  command: docker
+  regex: \b(ps|images|logs|inspect|build)\b
+  reason: Docker inspection / build allowed.
+- name: docker_compose_inspection
+  command: docker
+  regex: \bcompose\s+(ps|logs|config|build)\b
+  reason: Docker Compose inspection allowed.
+- name: git_inspection
+  command: git
+  regex: \b(status|diff|log|branch|show|check-ignore|rev-parse)\b
+  reason: Read-only git command allowed.
+- name: curl_read_only
+  command: curl
+  negative_regex: -X\s*(POST|PUT|DELETE|PATCH)|-d\s*@
+  reason: Read-only HTTP query allowed.
+- name: shell_syntax_check
+  command: shellcheck|shfmt
+  reason: Shell script syntax check allowed.
+- name: bash_syntax_check
+  command: bash|zsh|sh
+  regex: -n\b
+  reason: Shell script syntax check allowed.
+default_action: allow

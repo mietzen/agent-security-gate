@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+Agent Security Gate (agent-guard)
+Universal Security & Safety Policy Engine for AI Coding Agents.
+
+Supports:
+- Google Antigravity (agy)
+- Claude Code
+- OpenAI Codex
+- Pi CLI / Pi Agent
+- Cline (VS Code Autonomous Agent)
+- Roo Code (Roo-Cline)
+- Gemini CLI
+- GitHub Copilot CLI & VS Code GitHub Copilot Chat
+- OpenCode
+- Mistral Vibe
+- Continue.dev
+- Goose (Block AI)
+- Aider
+- Factory Droid
+- Cursor / Windsurf
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+__version__ = "1.3.0"
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+INSTRUCTIONS_MARKDOWN = """
+# 🛡️ Agent Security Gate Guidelines
+
+This machine uses **Agent Security Gate** (`agent-guard`) to enforce security policies across shell commands.
+Security database location: `~/.config/agent-security-gate/security_policy.yaml` (or `~/.gemini/config/security_policy.yaml`).
+
+## Protocol for Proposing and Adding New Tools
+
+1. **Proactive Tool Suggestions**: When working with new CLI tools, linters, or infrastructure utilities (e.g. `terraform`, `helm`, `kubectl`, `ansible`) that are not yet in `security_policy.yaml`, you are encouraged to ask the user if they would like to add them.
+2. **Consent Requirement**: NEVER modify `security_policy.yaml` autonomously. Always ask the user for confirmation first.
+3. **Adding Rules**: Once approved by the user, add the entry to `security_policy.yaml` under `auto_allowed`, `confirm_required` (`force_ask`), or `hard_deny`.
+"""
+
+def get_policy_paths():
+    """Returns candidate paths for the security policy in precedence order."""
+    candidates = [
+        os.path.expanduser("~/.gemini/config/security_policy.yaml"),
+        os.path.expanduser("~/.config/agent-security-gate/security_policy.yaml"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "security_policy.yaml")
+    ]
+    return candidates
+
+def load_policy():
+    """Loads the YAML security policy database."""
+    for path in get_policy_paths():
+        if os.path.exists(path) and yaml is not None:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return yaml.safe_load(f) or {}
+            except Exception:
+                continue
+    return {}
+
+def is_in_dir(target_path, parent_dir):
+    try:
+        target = os.path.realpath(os.path.abspath(os.path.expanduser(target_path)))
+        parent = os.path.realpath(os.path.abspath(os.path.expanduser(parent_dir)))
+        return os.path.commonpath([target, parent]) == parent
+    except Exception:
+        return False
+
+def get_invoked_commands(cmd_str):
+    """
+    Extracts executable command names across pipelines (|), logic operators (&&, ||),
+    and sequencing (;), while ignoring quoted strings, heredocs, and comments.
+    """
+    try:
+        tokens = shlex.split(cmd_str)
+    except Exception:
+        tokens = cmd_str.split()
+
+    executables = []
+    expect_command = True
+
+    for t in tokens:
+        if t in (";", "&&", "||", "|", "&"):
+            expect_command = True
+            continue
+        if expect_command:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", t):
+                continue
+            base_cmd = os.path.basename(t)
+            executables.append(base_cmd)
+            expect_command = False
+
+    return executables
+
+def is_cmd_invoked(pattern, eval_cmd):
+    invoked = get_invoked_commands(eval_cmd)
+    return any(re.fullmatch(rf"({pattern})", cmd) for cmd in invoked)
+
+def check_rule_match(rule, eval_cmd):
+    if "command" in rule:
+        if not is_cmd_invoked(rule["command"], eval_cmd):
+            return False
+    if "regex" in rule:
+        if not re.search(rule["regex"], eval_cmd):
+            return False
+    if "negative_regex" in rule:
+        if re.search(rule["negative_regex"], eval_cmd):
+            return False
+    return True
+
+def evaluate_deletion(eval_cmd, cwd, workspace_paths, deletion_cfg):
+    is_rm = is_cmd_invoked(r"rm|rmdir|unlink", eval_cmd)
+    is_find_delete = is_cmd_invoked(r"find", eval_cmd) and bool(re.search(r"(-delete|-exec\s+rm\b)", eval_cmd))
+
+    if not (is_rm or is_find_delete):
+        return None, None
+
+    temp_roots = [
+        "/tmp",
+        "/private/tmp",
+        tempfile.gettempdir(),
+        "/var/folders"
+    ]
+    if os.environ.get("TMPDIR"):
+        temp_roots.append(os.environ.get("TMPDIR"))
+
+    tokens = []
+    try:
+        tokens = shlex.split(eval_cmd)
+    except Exception:
+        tokens = eval_cmd.split()
+
+    paths_to_check = []
+    if is_rm:
+        try:
+            idx = -1
+            for i, t in enumerate(tokens):
+                base_t = os.path.basename(t)
+                if base_t in ("rm", "rmdir", "unlink"):
+                    idx = i
+                    break
+            if idx != -1:
+                for t in tokens[idx+1:]:
+                    if not t.startswith("-") and t not in (">", ">>", "|", "&&", "||", ";"):
+                        paths_to_check.append(t)
+        except Exception:
+            pass
+    elif is_find_delete:
+        try:
+            for i, t in enumerate(tokens):
+                if os.path.basename(t) == "find" and i + 1 < len(tokens):
+                    target = tokens[i+1]
+                    if not target.startswith("-"):
+                        paths_to_check.append(target)
+        except Exception:
+            pass
+
+    on_temp = deletion_cfg.get("on_temp", "allow")
+    on_workspace = deletion_cfg.get("on_workspace", "force_ask")
+    on_external = deletion_cfg.get("on_external", "deny")
+
+    if paths_to_check:
+        for p in paths_to_check:
+            full_p = os.path.join(cwd, os.path.expanduser(p)) if not os.path.isabs(os.path.expanduser(p)) else os.path.expanduser(p)
+            
+            in_temp = any(is_in_dir(full_p, tr) for tr in temp_roots)
+            if in_temp:
+                continue
+
+            in_ws = any(is_in_dir(full_p, ws) for ws in ([cwd] + workspace_paths))
+            if in_ws:
+                return on_workspace, f"Confirm deletion of file/directory in workspace: {p}"
+            else:
+                return on_external, f"Deleting files outside workspace and temp directory is forbidden: {p}"
+
+        return on_temp, "Temporary file/directory cleanup allowed."
+    else:
+        return on_workspace, "Confirm file deletion command."
+
+def evaluate_command(command, cwd, workspace_paths, policy=None):
+    cmd = command.strip()
+    if not cmd:
+        return "allow", "Empty command"
+
+    eval_cmd = cmd
+    if eval_cmd.startswith("rtk "):
+        eval_cmd = eval_cmd[4:].strip()
+
+    if policy is None:
+        policy = load_policy()
+
+    # 1. HARD DENY
+    for rule in policy.get("hard_deny", []):
+        if check_rule_match(rule, eval_cmd):
+            return "deny", rule.get("reason", "Command is forbidden by security policy.")
+
+    # 2. FILE DELETION ENGINE
+    del_decision, del_reason = evaluate_deletion(eval_cmd, cwd, workspace_paths, policy.get("deletion_engine", {}))
+    if del_decision is not None:
+        return del_decision, del_reason
+
+    # 3. CONFIRMATION REQUIRED
+    for rule in policy.get("confirm_required", []):
+        if check_rule_match(rule, eval_cmd):
+            return "force_ask", rule.get("reason", "Action requires human confirmation.")
+
+    # 4. AUTO ALLOWED
+    for rule in policy.get("auto_allowed", []):
+        if check_rule_match(rule, eval_cmd):
+            return "allow", rule.get("reason", "Allowed by security policy.")
+
+    return policy.get("default_action", "allow"), "Default policy action."
+
+def parse_agent_payload(raw_json):
+    """
+    Auto-detects the agent harness from the JSON payload structure.
+    Returns (harness_name, command, cwd, workspace_paths)
+    """
+    try:
+        data = json.loads(raw_json)
+    except Exception:
+        return "unknown", raw_json.strip(), os.getcwd(), [os.getcwd()]
+
+    cwd = os.getcwd()
+    workspace_paths = [cwd]
+
+    # 1. Google Antigravity
+    if "toolCall" in data:
+        tool_call = data.get("toolCall", {})
+        args = tool_call.get("args", {})
+        command = args.get("CommandLine", "") or args.get("command", "")
+        cwd = args.get("Cwd", cwd)
+        workspace_paths = data.get("workspacePaths", [cwd])
+        return "antigravity", command, cwd, workspace_paths
+
+    # 2. Cline / Roo Code (VS Code Autonomous Coding Agents)
+    if data.get("tool") == "execute_command" or "execute_command" in data.get("name", ""):
+        args = data.get("args") or data.get("parameters") or {}
+        command = args.get("command", "") or args.get("CommandLine", "")
+        cwd = data.get("cwd", cwd)
+        return "cline", command, cwd, workspace_paths
+
+    # 3. GitHub Copilot CLI / VS Code Copilot Chat / Claude Code / Gemini CLI / Codex
+    if "tool_input" in data or "tool_name" in data:
+        tool_input = data.get("tool_input", {})
+        command = tool_input.get("command", "") or tool_input.get("CommandLine", "")
+        cwd = data.get("cwd", cwd)
+        flavor = "copilot" if "copilot" in data.get("agent", "").lower() else "claude_or_copilot"
+        return flavor, command, cwd, workspace_paths
+
+    # 4. OpenCode / Pi CLI
+    if "tool" in data and "args" in data:
+        args = data.get("args", {})
+        command = args.get("command", "") or args.get("CommandLine", "")
+        cwd = data.get("cwd", cwd)
+        return "opencode", command, cwd, workspace_paths
+
+    # 5. Continue.dev / Goose
+    if "name" in data and ("terminal" in data.get("name", "") or "shell" in data.get("name", "")):
+        args = data.get("arguments") or data.get("args") or {}
+        command = args.get("command", "") or args.get("cmd", "")
+        return "continue_or_goose", command, cwd, workspace_paths
+
+    # 6. Fallback Generic
+    command = data.get("command", "") or data.get("CommandLine", "") or data.get("cmd", "")
+    return "generic", command, cwd, workspace_paths
+
+def format_agent_response(harness, decision, reason):
+    """Formats the decision according to the specific agent protocol."""
+    if harness == "antigravity":
+        return {"decision": decision, "reason": reason}
+    elif harness in ("copilot", "claude_or_copilot"):
+        copilot_decision = "ask_user" if decision in ("ask", "force_ask") else decision
+        return {
+            "decision": copilot_decision,
+            "hookSpecificOutput": {
+                "permissionDecisionReason": reason
+            }
+        }
+    elif harness in ("opencode", "cline", "continue_or_goose"):
+        opencode_decision = "ask" if decision in ("ask", "force_ask") else decision
+        return {"decision": opencode_decision, "message": reason}
+    else:
+        return {"decision": decision, "reason": reason}
+
+def handle_hook_eval():
+    """Reads stdin JSON, evaluates command, outputs response JSON."""
+    raw_input = sys.stdin.read()
+    if not raw_input.strip():
+        print(json.dumps({"decision": "allow"}))
+        return
+
+    harness, command, cwd, workspace_paths = parse_agent_payload(raw_input)
+    if not command:
+        print(json.dumps(format_agent_response(harness, "allow", "No command found")))
+        return
+
+    decision, reason = evaluate_command(command, cwd, workspace_paths)
+    response = format_agent_response(harness, decision, reason)
+    print(json.dumps(response))
+
+def handle_check(command_str):
+    """Dry-runs a command against the security policy database."""
+    policy = load_policy()
+    cwd = os.getcwd()
+    decision, reason = evaluate_command(command_str, cwd, [cwd], policy)
+    print(f"Command : {command_str}")
+    print(f"Decision: {decision.upper()}")
+    print(f"Reason  : {reason}")
+
+def patch_json_config(file_path, mutator_func):
+    """Safely reads, modifies via mutator_func, and writes a JSON config file."""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    data = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    
+    modified_data = mutator_func(data)
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(modified_data, f, indent=2)
+
+def append_instruction_file(file_path):
+    """Appends security gate guidelines to global instruction files if not already present."""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    content = ""
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            content = ""
+    if "Agent Security Gate" not in content and "agent-guard" not in content:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write("\n" + INSTRUCTIONS_MARKDOWN.strip() + "\n")
+        print(f"  ✓ Injected instructions into {file_path}")
+
+def install_antigravity_hook():
+    path = os.path.expanduser("~/.gemini/config/hooks.json")
+    def mutator(data):
+        if "security-gate" not in data:
+            data["security-gate"] = {}
+        data["security-gate"]["PreToolUse"] = [
+            {
+                "matcher": "run_command",
+                "hooks": [{"type": "command", "command": "agent-guard"}]
+            }
+        ]
+        return data
+    patch_json_config(path, mutator)
+    append_instruction_file(os.path.expanduser("~/.gemini/config/AGENTS.md"))
+    append_instruction_file(os.path.expanduser("~/.gemini/config/GEMINI.md"))
+    print(f"  ✓ Google Antigravity ({path})")
+
+def install_claude_hook():
+    path = os.path.expanduser("~/.claude/settings.json")
+    def mutator(data):
+        if "hooks" not in data or not isinstance(data["hooks"], dict):
+            data["hooks"] = {}
+        data["hooks"]["PreToolUse"] = [
+            {
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": "agent-guard"}]
+            }
+        ]
+        return data
+    patch_json_config(path, mutator)
+    append_instruction_file(os.path.expanduser("~/.claude/CLAUDE.md"))
+    print(f"  ✓ Claude Code ({path})")
+
+def install_codex_hook():
+    path = os.path.expanduser("~/.codex/hooks.json")
+    def mutator(data):
+        data["PreToolUse"] = [{"command": "agent-guard"}]
+        return data
+    patch_json_config(path, mutator)
+    append_instruction_file(os.path.expanduser("~/.codex/AGENTS.md"))
+    print(f"  ✓ OpenAI Codex ({path})")
+
+def install_pi_hook():
+    path = os.path.expanduser("~/.pi/hooks.json")
+    def mutator(data):
+        data["PreToolUse"] = [{"command": "agent-guard"}]
+        return data
+    patch_json_config(path, mutator)
+    append_instruction_file(os.path.expanduser("~/.pi/AGENTS.md"))
+    print(f"  ✓ Pi CLI / Agent ({path})")
+
+def install_cline_hook():
+    append_instruction_file(os.path.expanduser("~/.clinerules"))
+    append_instruction_file(os.path.expanduser("~/.config/cline/instructions.md"))
+    print(f"  ✓ Cline (~/.clinerules)")
+
+def install_roo_hook():
+    append_instruction_file(os.path.expanduser("~/.roorules"))
+    append_instruction_file(os.path.expanduser("~/.config/roo/instructions.md"))
+    print(f"  ✓ Roo Code (~/.roorules)")
+
+def install_continue_hook():
+    path = os.path.expanduser("~/.continue/config.json")
+    patch_json_config(path, lambda d: d)
+    append_instruction_file(os.path.expanduser("~/.continue/rules/security.md"))
+    print(f"  ✓ Continue.dev (~/.continue/)")
+
+def install_gemini_hook():
+    path = os.path.expanduser("~/.gemini/settings.json")
+    def mutator(data):
+        if "hooks" not in data or not isinstance(data["hooks"], dict):
+            data["hooks"] = {}
+        data["hooks"]["BeforeTool"] = [
+            {
+                "matcher": "run_shell_command",
+                "command": "agent-guard"
+            }
+        ]
+        return data
+    patch_json_config(path, mutator)
+    append_instruction_file(os.path.expanduser("~/.gemini/GEMINI.md"))
+    print(f"  ✓ Gemini CLI ({path})")
+
+def install_copilot_hook():
+    path = os.path.expanduser("~/.config/github-copilot/hooks.json")
+    def mutator(data):
+        data["preToolUse"] = [{"command": "agent-guard"}]
+        return data
+    patch_json_config(path, mutator)
+    append_instruction_file(os.path.expanduser("~/.config/github-copilot/COPILOT.md"))
+    print(f"  ✓ GitHub Copilot CLI ({path})")
+
+def install_opencode_hook():
+    path = os.path.expanduser("~/.config/opencode/hooks.json")
+    def mutator(data):
+        data["PreToolUse"] = [{"tool": "bash", "command": "agent-guard"}]
+        return data
+    patch_json_config(path, mutator)
+    append_instruction_file(os.path.expanduser("~/.config/opencode/AGENTS.md"))
+    print(f"  ✓ OpenCode ({path})")
+
+def install_vibe_hook():
+    path = os.path.expanduser("~/.vibe/config.toml")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    content = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    if "agent-guard" not in content:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n[hooks]\npre_tool = \"agent-guard\"\n")
+    print(f"  ✓ Mistral Vibe ({path})")
+
+def install_factory_hook():
+    path = os.path.expanduser("~/.factory/hooks.json")
+    def mutator(data):
+        data["Execute"] = [{"command": "agent-guard"}]
+        return data
+    patch_json_config(path, mutator)
+    print(f"  ✓ Factory Droid ({path})")
+
+def handle_init(args):
+    """Auto-patches configuration hooks and global instructions for target AI coding tools."""
+    print("Configuring Agent Security Gate hooks and instructions:")
+    
+    install_all = args.all or not any([
+        args.antigravity, args.claude, args.codex, args.pi, args.cline,
+        args.roo, args.gemini, args.copilot, args.opencode, args.vibe,
+        args.continue_dev, args.factory
+    ])
+
+    if install_all or args.antigravity:
+        install_antigravity_hook()
+    if install_all or args.claude:
+        install_claude_hook()
+    if install_all or args.codex:
+        install_codex_hook()
+    if install_all or args.pi:
+        install_pi_hook()
+    if install_all or args.cline:
+        install_cline_hook()
+    if install_all or args.roo:
+        install_roo_hook()
+    if install_all or args.gemini:
+        install_gemini_hook()
+    if install_all or args.copilot:
+        install_copilot_hook()
+    if install_all or args.opencode:
+        install_opencode_hook()
+    if install_all or args.vibe:
+        install_vibe_hook()
+    if install_all or args.continue_dev:
+        install_continue_hook()
+    if install_all or args.factory:
+        install_factory_hook()
+
+    print("\nAll selected agent hooks & global instructions configured successfully!")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Agent Security Gate: Universal Safety & Policy Engine for AI Coding Agents."
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"agent-guard {__version__}")
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    # eval / hook
+    subparsers.add_parser("eval", help="Process hook input from stdin (default mode)")
+    subparsers.add_parser("hook", help="Alias for eval")
+
+    # check
+    check_parser = subparsers.add_parser("check", help="Dry-run a command against security policy")
+    check_parser.add_argument("command", help="Command string to evaluate")
+
+    # init
+    init_parser = subparsers.add_parser("init", help="Initialize hooks & global instructions for AI agents")
+    init_parser.add_argument("--all", action="store_true", help="Install hooks & instructions for all supported agents (default)")
+    init_parser.add_argument("--antigravity", action="store_true", help="Install Google Antigravity hook & AGENTS.md")
+    init_parser.add_argument("--claude", action="store_true", help="Install Claude Code hook & CLAUDE.md")
+    init_parser.add_argument("--codex", action="store_true", help="Install OpenAI Codex hook & AGENTS.md")
+    init_parser.add_argument("--pi", action="store_true", help="Install Pi CLI hook & AGENTS.md")
+    init_parser.add_argument("--cline", action="store_true", help="Install Cline rules (~/.clinerules)")
+    init_parser.add_argument("--roo", action="store_true", help="Install Roo Code rules (~/.roorules)")
+    init_parser.add_argument("--gemini", action="store_true", help="Install Gemini CLI hook & GEMINI.md")
+    init_parser.add_argument("--copilot", action="store_true", help="Install GitHub Copilot hook & COPILOT.md")
+    init_parser.add_argument("--opencode", action="store_true", help="Install OpenCode hook & AGENTS.md")
+    init_parser.add_argument("--vibe", action="store_true", help="Install Mistral Vibe hook")
+    init_parser.add_argument("--continue-dev", action="store_true", help="Install Continue.dev security rules")
+    init_parser.add_argument("--factory", action="store_true", help="Install Factory Droid hook")
+
+    # policy
+    policy_parser = subparsers.add_parser("policy", help="Show or inspect the active policy file")
+    policy_parser.add_argument("action", choices=["path", "show"], default="path", nargs="?")
+
+    if len(sys.argv) == 1:
+        if not sys.stdin.isatty():
+            handle_hook_eval()
+            return
+        else:
+            parser.print_help()
+            return
+
+    args = parser.parse_args()
+
+    if args.subcommand in ("eval", "hook"):
+        handle_hook_eval()
+    elif args.subcommand == "check":
+        handle_check(args.command)
+    elif args.subcommand == "init":
+        handle_init(args)
+    elif args.subcommand == "policy":
+        paths = get_policy_paths()
+        existing = next((p for p in paths if os.path.exists(p)), paths[0])
+        if args.action == "path":
+            print(existing)
+        elif args.action == "show":
+            with open(existing, "r", encoding="utf-8") as f:
+                print(f.read())
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
