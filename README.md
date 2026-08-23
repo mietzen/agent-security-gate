@@ -2,8 +2,6 @@
 
 `agent-guard` is a lightweight, cross-platform security hook and policy engine for AI coding assistants. It intercepts shell commands before execution via native lifecycle hooks (`PreToolUse`, `BeforeTool`, `preToolUseHooks`) and enforces a deterministic YAML security policy.
 
-It provides zero-dependency, sub-5ms execution without Node.js or `npx` overhead. It dynamically resolves path boundaries (e.g. allowing `/tmp` cleanup while prompting for workspace deletions and denying external system deletions) and synchronizes global agent instructions across all supported tools.
-
 ## Prerequisites
 
 - **macOS or Linux**
